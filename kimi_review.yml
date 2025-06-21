@@ -1,129 +1,109 @@
-# ────────────────────────────────────────────────────────────────────────────────
-#  GitHub Action · Automated Pull-Request Reviews with Moonshot Kimi-Dev-72B
+# .github/workflows/kimi-review.yml
 #
-#  ▸ First run (PR opened)       : sends nearly the whole repo to the 128-k-context
-#                                  model for a big-picture review.
-#  ▸ Subsequent pushes to the PR : sends only the diff to the 32-k-context model
-#                                  for fast incremental feedback.
-#  ▸ Manual “Run workflow”       : always performs a full-repo review (128-k model).
+# PR reviews by Moonshot Kimi-Dev-72B
+# • First push      → whole repo  (128 K model)
+# • Later pushes    → diff only   (32 K model)
+# • Manual button   → whole repo  (128 K model)
+# Duplicate jobs auto-cancel via the built-in concurrency key.
 #
-#  One REQUIRED secret (add in Settings ▸ Secrets ▸ Actions):
-#     MOONSHOT_AI_KIMIDEV = sk-xxxxxxxxxxxxxxxxxxxxxxxx   (raw Moonshot project key)
-# ────────────────────────────────────────────────────────────────────────────────
+# SECRET required:
+#   MOONSHOT_AI_KIMIDEV = sk-xxxxxxxxxxxxxxxxxxxxxxxx
+# ---------------------------------------------------------------------------
 
-name: "Kimi code review (full-then-diff + manual)"
+name: "Kimi code review"
 
-# ── triggers ───────────────────────────────────────────────────────────────────
 on:
   pull_request:
-    types: [opened, synchronize]          # opened = first PR, synchronize = new commits
-  workflow_dispatch:                      # adds the “Run workflow” button
+    types: [opened, synchronize]
+  workflow_dispatch:                 # “Run workflow” button
 
-# ── main job ───────────────────────────────────────────────────────────────────
+# let only ONE run per branch live; older ones are canceled by GitHub itself
+concurrency:
+  group: kimi-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true           # GitHub Docs   :contentReference[oaicite:3]{index=3}
+
 jobs:
   review:
-    runs-on: ubuntu-latest               # free GitHub-hosted Linux runner
-
-    permissions:                         # allow checkout + PR comment
+    runs-on: ubuntu-latest
+    permissions:
       contents: read
-      pull-requests: write
+      pull-requests: write          # just enough to comment
 
     steps:
-    # 1) Check out repo so we can read files/diffs
-    - name: "Checkout code"
-      uses: actions/checkout@v4
-      with: { fetch-depth: 0 }           # full history → cleaner diffs
+      # 0) Immediate feedback so you see activity while the runner is spun up
+      - name: Alive ping
+        run: echo "🕐 Kimi review workflow has started – waiting for runner…"
 
-    # 2) Decide what we’re reviewing and which model to use
-    - name: "Set context variables"
-      id: ctx
-      run: |
-        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-          # manual run ➜ full repo, 128-k model
-          echo "MODE=kimidev-72b-128k"  >> "$GITHUB_OUTPUT"
-          echo "SCOPE=repo"             >> "$GITHUB_OUTPUT"
-        elif [ "${{ github.event.action }}" = "opened" ]; then
-          # first time PR opens ➜ full repo
-          echo "MODE=kimidev-72b-128k"  >> "$GITHUB_OUTPUT"
-          echo "SCOPE=repo"             >> "$GITHUB_OUTPUT"
-        else
-          # later commits ➜ diff-only, 32-k model
-          echo "MODE=kimidev-72b-32k"   >> "$GITHUB_OUTPUT"
-          echo "SCOPE=diff"             >> "$GITHUB_OUTPUT"
-        fi
+      # 1) Checkout
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
 
-    # 3) Gather the text we’ll send to Kimi
-    - name: "Collect code to review"
-      id: blob
-      run: |
-        if [ "${{ steps.ctx.outputs.SCOPE }}" = "repo" ]; then
-          # CONCATENATE every tracked file; trim to ~360 000 chars ≈ 90 000 tokens
-          git ls-files -z | xargs -0 cat | head -c 360000 > review.txt
-        else
-          # Only the patch/diff for this PR
-          curl -sL "${{ github.event.pull_request.diff_url }}" > review.txt
-        fi
-        # Replace back-ticks so Markdown in comments isn’t broken
-        sed -i 's/`/‘‘/g' review.txt
-        # Base64-encode so it survives YAML/environment parsing
-        echo "BLOB=$(base64 -w0 review.txt)" >> "$GITHUB_OUTPUT"
+      # 2) Decide scope/model
+      - id: ctx
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" || \
+                "${{ github.event.action }}" == "opened" ]]; then
+            echo "MODE=kimidev-72b-128k"  >>"$GITHUB_OUTPUT"
+            echo "SCOPE=repo"             >>"$GITHUB_OUTPUT"
+          else
+            echo "MODE=kimidev-72b-32k"   >>"$GITHUB_OUTPUT"
+            echo "SCOPE=diff"             >>"$GITHUB_OUTPUT"
+          fi
 
-    # 4) Call Moonshot’s chat/completions endpoint
-    - name: "Ask Kimi-Dev"
-      id: kimi
-      env:
-        MOONSHOT_KEY: ${{ secrets.MOONSHOT_AI_KIMIDEV }}
-      run: |
-        set -e
+      # 3) Collect text
+      - id: collect
+        run: |
+          if [[ "${{ steps.ctx.outputs.SCOPE }}" == "repo" ]]; then
+            git ls-files -z | xargs -0 cat | head -c 360000 > blob.txt
+          else
+            curl -sL "${{ github.event.pull_request.diff_url }}" > blob.txt
+          fi
+          sed -i 's/`/‘‘/g' blob.txt
+          echo "BLOB=$(base64 -w0 blob.txt)" >>"$GITHUB_OUTPUT"
 
-        MODEL="${{ steps.ctx.outputs.MODE }}"
-        DIFF_JSON=$(echo "${{ steps.blob.outputs.BLOB }}" | base64 -d | jq -Rs .)
+      # 4) Call Moonshot
+      - id: kimi
+        env:
+          MOONSHOT_KEY: ${{ secrets.MOONSHOT_AI_KIMIDEV }}
+        run: |
+          MODEL="${{ steps.ctx.outputs.MODE }}"
+          DATA=$(echo "${{ steps.collect.outputs.BLOB }}" | base64 -d | jq -Rs .)
+          jq -n --arg m "$MODEL" --arg d "$DATA" '{
+            model: $m,
+            messages:[
+              {role:"system",content:"You are an expert software engineer. Provide a concise, line-referenced GitHub code review."},
+              {role:"user",   content: ($d|fromjson)}
+            ],
+            max_tokens:512, temperature:0.2
+          }' > payload.json
 
-        jq -n --arg m "$MODEL" --arg diff "$DIFF_JSON" '
-        { model:$m,
-          messages:[
-            {role:"system",
-             content:"You are an expert software engineer. Provide a concise, line-referenced GitHub code review of the content supplied."},
-            {role:"user", content:($diff|fromjson)}
-          ],
-          max_tokens:512,
-          temperature:0.2
-        }' > payload.json
+          STATUS=$(curl -s -w "%{http_code}" -o resp.json \
+                   -H "Authorization: Bearer $MOONSHOT_KEY" \
+                   -H "Content-Type: application/json" \
+                   --data @payload.json \
+                   https://api.moonshot.ai/v1/chat/completions)
+          echo "Moonshot HTTP $STATUS" ; cat resp.json
+          [ "$STATUS" == 200 ] || exit 1
+          jq -r '.choices[0].message.content' resp.json > review.txt
+          echo "REVIEW<<EOF" >>"$GITHUB_OUTPUT" && cat review.txt >>"$GITHUB_OUTPUT" && echo "EOF" >>"$GITHUB_OUTPUT"
 
-        STATUS=$(curl -s -o resp.json -w "%{http_code}" \
-          -H "Authorization: Bearer $MOONSHOT_KEY" \
-          -H "Content-Type: application/json" \
-          --data @payload.json \
-          https://api.moonshot.ai/v1/chat/completions)
+      # 5) Comment (skip when run manually)
+      - if: github.event_name != 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BODY=$(jq -Rs '.' <<< "🤖 **Kimi-Dev review**  \n_Model:_ ${{ steps.ctx.outputs.MODE }}\n\n$(cat review.txt)")
+          curl -s -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -d '{"body": $BODY}' \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments"
 
-        echo "Moonshot HTTP status: $STATUS"
-        cat resp.json
-        [ "$STATUS" = "200" ] || exit 1       # fail job if API failed
+      # 6) Archive raw JSON (optional debug)
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: moonshot-response
+          path: resp.json
 
-        REVIEW=$(jq -r '.choices[0].message.content' resp.json)
-        echo "REVIEW<<EOF" >> "$GITHUB_OUTPUT"
-        echo "$REVIEW"      >> "$GITHUB_OUTPUT"
-        echo "EOF"          >> "$GITHUB_OUTPUT"
-
-    # 5) Post the review comment (skipped for manual runs because no PR context)
-    - name: "Comment on PR"
-      if: github.event_name != 'workflow_dispatch'
-      env:
-        GH_TOKEN: ${{ github.token }}        # GitHub injects this automatically
-      run: |
-        BODY=$(jq -Rs '.' <<< "🤖 **Kimi-Dev review**  
-        _Model:_ ${{ steps.ctx.outputs.MODE }}\n\n${{ steps.kimi.outputs.REVIEW }}")
-
-        curl -s -X POST \
-          -H "Authorization: Bearer $GH_TOKEN" \
-          -H "Accept: application/vnd.github+json" \
-          -d "{\"body\": $BODY}" \
-          "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments"
-
-    # 6) Upload raw JSON response for troubleshooting (always runs)
-    - name: "Save raw response (debug)"
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: moonshot-response
-        path: resp.json
+# This is a minor change to trigger the workflow.
