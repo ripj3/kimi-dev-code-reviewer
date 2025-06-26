@@ -1,115 +1,350 @@
 # .github/workflows/kimi-review.yml
 #
-# Kimi-Dev 72 B PR reviewer
-# – Full repo review (128 K) on first PR commit or manual run,
-#   but **skips external libraries & build artefacts**.
-# – Diff-only review (32 K) on later commits (filtered the same way).
-# – Concurrency keeps only the newest run per branch.
+# Robust Kimi-Dev review bot — June 2025
+# • Tries 128 K model first; falls back automatically to 32 K or chat.
+# • Full-repo review (minus vendor folders) on first PR / manual button.
+# • Diff-only review on later pushes.
+# • Built-in concurrency; no self-cancelling.
 #
 # SECRET required:
-#   MOONSHOT_AI_KIMIDEV = sk-xxxxxxxxxxxxxxxxxxxxxxxx
-# ------------------------------------------------------------------------------
+#   MOONSHOT_KEY = sk-xxxxxxxxxxxxxxxxxxxxxxxx (ensure this secret is set in your repo settings)
+# ---------------------------------------------------------------------
 
-name: "Kimi code review"
+name: "Kimi-Dev Review Bot" # Improved clarity in the workflow name
 
 on:
   pull_request:
     types: [opened, synchronize]
-  workflow_dispatch:
+    branches:
+      - '*' # Runs on all branches when a Pull Request is opened or synchronized
+  workflow_dispatch: {} # Allows manual triggering from the GitHub Actions tab in the UI
 
 concurrency:
-  group: kimi-${{ github.head_ref || github.ref_name }}
-  cancel-in-progress: true
+  group: kimi-${{ github.head_ref || github.ref_name }} # Ensures only one review runs per branch/PR
+  cancel-in-progress: true # If a new commit is pushed, any ongoing review for that PR will be cancelled
 
 jobs:
   review:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest # The type of virtual machine GitHub provides for this job
+    timeout-minutes: 10 # NEW: Maximum time this job will run before being cancelled (safety measure)
     permissions:
-      contents: read
-      pull-requests: write
+      contents: read # Allows the workflow to read your repository's code
+      pull-requests: write # Allows the workflow to post comments on your pull requests
+
+    env:
+      # This pulls your secret named 'MOONSHOT_KEY' from your repository settings
+      MOONSHOT_KEY: ${{ secrets.MOONSHOT_KEY }}
+      # This is the order in which the bot will try to use Moonshot models
+      # IMPORTANT: If your preferred larger models (like kimidev-72b-128k) are not
+      # available, the bot will fall back to smaller ones, potentially leading
+      # to "token limit" errors if your code is too large for those smaller models.
+      FALLBACK_MODELS: "kimidev-72b-128k kimidev-72b-32k kimidev-72b-chat moonshot-v1-32k"
+      # NEW: Define common exclusion patterns for code collection here for easier modification
+      EXCLUDE_PATTERNS: 'node_modules|vendor|dist|build|\.next|\.venv|\.cache|__pycache__|env|venv|target'
+      # NEW: Maximum size for the entire collected code blob (in bytes)
+      # Roughly 120KB for a 32K token model (approx. 1 token = 4 bytes for code)
+      MAX_CODE_BLOB_BYTES: 120000 
+      # NEW: Maximum size for individual files within the collected code blob (in bytes)
+      MAX_SINGLE_FILE_BYTES: 100000 
+
 
     steps:
-# 0️⃣  quick feedback so you see the job is alive
-      - run: echo "🕐 Kimi review job queued…"
+      # --- Setup and Checks ---
 
-# 1️⃣  checkout repository
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
-
-# 2️⃣  decide scope + model
-      - id: ctx
+      # 1. Check for API Key (Fails early if missing)
+      # Improvement: Clearer step name, more direct feedback for a non-coder.
+      - name: 🔑 Verify Moonshot API Key is Set
         run: |
+          echo "Checking if the 'MOONSHOT_KEY' secret is available..."
+          if [[ -z "$MOONSHOT_KEY" ]]; then
+            echo "::error ::The 'MOONSHOT_KEY' secret is NOT set or is empty. This is required for the bot to work."
+            echo "Please go to your repository settings > Secrets and variables > Actions, and add a secret named 'MOONSHOT_KEY' with your Moonshot AI API key."
+            exit 1
+          fi
+          echo "✅ 'MOONSHOT_KEY' secret found. Proceeding."
+
+      # 2. Checkout Code (Required to access files)
+      # Improvement: Slightly more descriptive name.
+      - name: ⬇️ Checkout Repository Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # This is important: it gets the full history, needed for accurate code differences (diffs).
+
+      # --- Model Selection ---
+
+      # 3. Discover Available Moonshot Model
+      # Improvement: More descriptive step name, added more logging to show API response and what's being searched.
+      - name: 🤖 Discover an Available Moonshot AI Model
+        id: find_model # We give this step an ID so we can refer to its results later
+        run: |
+          echo "Attempting to retrieve the list of models currently available from Moonshot AI..."
+          
+          # This command fetches the list of models from Moonshot AI and extracts their IDs.
+          # If it fails (e.g., bad API key), 'list' might be empty.
+          list=$(curl -s https://api.moonshot.ai/v1/models \
+                  -H "Authorization: Bearer $MOONSHOT_KEY" | jq -r '.data[].id')
+          
+          if [ -z "$list" ]; then
+            echo "::error ::Moonshot AI API returned an empty list of models or an error occurred during the API call."
+            echo "This usually means your 'MOONSHOT_KEY' is incorrect, expired, or there's a temporary issue with Moonshot AI service."
+            echo "Please double-check your 'MOONSHOT_KEY' secret value."
+            exit 1 # Stop the workflow here if we can't even get the model list
+          fi
+          
+          echo "✅ Successfully retrieved models from Moonshot AI. Available models: [$list]"
+          echo "Searching for a model from your preferred list: [$FALLBACK_MODELS]"
+
+          FOUND_MODEL="" # This variable will store the model we find
+          for slug in $FALLBACK_MODELS; do
+            # 'grep -qx "$slug"' checks if the exact model name exists in the list
+            if echo "$list" | grep -qx "$slug"; then
+              echo "Found an available preferred model: '$slug'"
+              FOUND_MODEL="$slug"
+              break # Stop searching, we found one!
+            fi
+          done
+
+          # This line makes the 'FOUND_MODEL' value available to later steps as 'steps.find_model.outputs.OK'
+          echo "OK=$FOUND_MODEL" >> $GITHUB_OUTPUT
+        shell: /usr/bin/bash -e {0} # Ensures standard shell behavior and exits if a command fails
+
+      # 4. Validate Selected Moonshot Model
+      # Improvement: Clearer name, direct message to the user about selected model or failure.
+      - name: ✔️ Validate Selected Moonshot Model
+        run: |
+          # Get the model name from the previous step's output
+          MODEL_TO_USE="${{ steps.find_model.outputs.OK }}"
+
+          if [[ -z "$MODEL_TO_USE" ]]; then
+            echo "::error ::None of your specified fallback models ($FALLBACK_MODELS) were found to be available from Moonshot AI."
+            echo "The review cannot proceed without a working model."
+            echo "Action required: Please verify the names in your 'FALLBACK_MODELS' list against Moonshot AI's current offerings."
+            exit 1 # Fail the workflow if no model could be selected
+          else
+            echo "✅ Selected Moonshot model for this review: '$MODEL_TO_USE'"
+            # This makes the selected model available as an environment variable to ALL following steps in this job.
+            echo "SELECTED_MOONSHOT_MODEL=$MODEL_TO_USE" >> $GITHUB_ENV
+          fi
+
+      # --- Code Collection ---
+
+      # 5. Determine Review Scope (Repo vs. Diff)
+      # Improvement: Simplified messages.
+      - name: 🔍 Determine Code Review Scope (Full Repo or Diff)
+        id: ctx # ID for this step's outputs
+        run: |
+          SCOPE=""
+          # Check if triggered manually or if it's the very first PR commit
           if [[ "${{ github.event_name }}" == "workflow_dispatch" || \
-                "${{ github.event.action }}" == "opened" ]]; then
-            echo "MODE=kimidev-72b-128k" >> "$GITHUB_OUTPUT"
-            echo "SCOPE=repo"            >> "$GITHUB_OUTPUT"
+                ( "${{ github.event_name }}" == "pull_request" && "${{ github.event.action }}" == "opened" ) ]]; then
+            SCOPE="repo"
+            echo "Review scope: Full Repository (suitable for initial PR reviews or manual runs)."
           else
-            echo "MODE=kimidev-72b-32k"  >> "$GITHUB_OUTPUT"
-            echo "SCOPE=diff"            >> "$GITHUB_OUTPUT"
+            SCOPE="diff"
+            echo "Review scope: Diff Changes Only (suitable for subsequent pushes to a PR)."
           fi
+          echo "SCOPE=$SCOPE" >> $GITHUB_OUTPUT # Output the chosen scope
 
-# 3️⃣  collect code, excluding common library / build folders
-      - id: collect
+      # 6. Collect Code Blob for Review
+      # IMPROVEMENT: Reduced MAX_CODE_BLOB_BYTES and MAX_SINGLE_FILE_BYTES to avoid token limits
+      - name: 📂 Collect Code to Send to AI
+        id: blob # ID for this step's outputs
         run: |
-          EXCLUDE='node_modules|vendor|dist|build|\.next|\.venv|\.cache|__pycache__'
+          BLOB_FILE="code_blob.txt" # The file where we'll put the code/diff
+          EXCLUDE_PATTERNS_VAR="${{ env.EXCLUDE_PATTERNS }}" # Use the env var defined at the top
+          MAX_CODE_BLOB_BYTES="${{ env.MAX_CODE_BLOB_BYTES }}" # Use the env var for total blob size
+          MAX_SINGLE_FILE_BYTES="${{ env.MAX_SINGLE_FILE_BYTES }}" # Use the env var for individual file size
+
+          echo "Excluding files matching patterns: $EXCLUDE_PATTERNS_VAR"
+          echo "Max total code for review: $((MAX_CODE_BLOB_BYTES / 1024))KB (approx. limit for 32k token models)."
+          echo "Max single file size: $((MAX_SINGLE_FILE_BYTES / 1024))KB."
+
           if [[ "${{ steps.ctx.outputs.SCOPE }}" == "repo" ]]; then
-            git ls-files -z | \
-              grep -zEv "(${EXCLUDE})" | \
-              xargs -0 cat | head -c 360000 > blob.txt
+            echo "Gathering full repository content (excluding specified folders/files)..."
+            # This finds all files, filters out excluded ones, and adds them to BLOB_FILE.
+            find . -type f -print0 | grep -zEv "(${EXCLUDE_PATTERNS_VAR})/" | \
+              xargs -0 -I{} bash -c '
+                FILE_PATH="{}"
+                FILE_SIZE=$(wc -c < "$FILE_PATH")
+                if [[ "$FILE_SIZE" -lt '$MAX_SINGLE_FILE_BYTES' ]]; then # Use MAX_SINGLE_FILE_BYTES
+                  echo "--- FILE_START: $FILE_PATH --- (Size: $FILE_SIZE bytes)" >> "'"$BLOB_FILE"'"
+                  cat "$FILE_PATH" >> "'"$BLOB_FILE"'"
+                  echo "" >> "'"$BLOB_FILE"'" # Newline after content
+                  echo "--- FILE_END: $FILE_PATH ---" >> "'"$BLOB_FILE"'"
+                  echo "" >> "'"$BLOB_FILE"'" # Newline to separate files
+                else
+                  echo "Skipping large file: '$FILE_PATH' (Size: $FILE_SIZE bytes, max $((MAX_SINGLE_FILE_BYTES / 1024))KB allowed)." >&2
+                fi
+              '
+            # Cap the total blob size. This is crucial for LLM context limits.
+            head -c ${MAX_CODE_BLOB_BYTES} "$BLOB_FILE" > "$BLOB_FILE.tmp" && mv "$BLOB_FILE.tmp" "$BLOB_FILE"
+            echo "::notice ::The collected code blob was capped at approximately $((MAX_CODE_BLOB_BYTES / 1024))KB to fit model token limits."
           else
+            echo "Collecting code differences (diff) for review (excluding specified folders/files)..."
+            # Fetches the raw diff and filters out excluded paths.
             curl -sL "${{ github.event.pull_request.diff_url }}" | \
-              grep -Ev "^diff --git a/(${EXCLUDE})/" > blob.txt
+              grep -Ev "^(diff --git a/|--- a/|+++ b/)((${EXCLUDE_PATTERNS_VAR})|vendor)/" > "$BLOB_FILE"
+            
+            # Diff content might also be too large, cap it as well
+            head -c ${MAX_CODE_BLOB_BYTES} "$BLOB_FILE" > "$BLOB_FILE.tmp" && mv "$BLOB_FILE.tmp" "$BLOB_FILE"
+            echo "::notice ::The collected diff blob was capped at approximately $((MAX_CODE_BLOB_BYTES / 1024))KB to fit model token limits."
           fi
-          sed -i 's/`/‘‘/g' blob.txt
-          echo "FILE=blob.txt" >> "$GITHUB_OUTPUT"
+          
+          # Replace backticks (`) with a different character to prevent Markdown formatting issues in the final review comment.
+          sed -i 's/`/‘‘/g' "$BLOB_FILE"
 
-# 4️⃣  call Moonshot
-      - id: kimi
-        env: { MOONSHOT_KEY: ${{ secrets.MOONSHOT_AI_KIMIDEV }} }
-        run: |
-          MODEL="${{ steps.ctx.outputs.MODE }}"
-          DIFF_JSON=$(jq -Rs . < "${{ steps.collect.outputs.FILE }}")
+          # Check if the collected code blob is empty.
+          if [ ! -s "$BLOB_FILE" ]; then
+            echo "::warning ::Collected code blob ($BLOB_FILE) is EMPTY. This means there might be no relevant code changes to review, or all changes were in excluded folders/files."
+            echo "::notice ::Moonshot AI review generation will be skipped as there's no code to analyze."
+            echo "REVIEW_SKIPPED=true" >> $GITHUB_OUTPUT # Signal to later steps that the review was skipped
+            exit 0 # Exit this step successfully, but indicate no review happened
+          fi
 
-          jq -n --arg m "$MODEL" --argjson diff "$DIFF_JSON" '{
-            model: $m,
-            messages: [
-              {role:"system",
-               content:"You are an expert software engineer. Provide a concise, line-referenced GitHub code review of the content supplied."},
-              {role:"user", content: $diff}
-            ],
-            max_tokens: 512,
-            temperature: 0.2
-          }' > payload.json
+          echo "✅ Code blob collected to: '$BLOB_FILE' (Total size: $(wc -c < "$BLOB_FILE") bytes)."
+          echo "FILE=$BLOB_FILE" >> $GITHUB_OUTPUT # Output the path to the blob file for later steps
 
-          STATUS=$(curl -s -o resp.json -w "%{http_code}" \
-                   -H "Authorization: Bearer $MOONSHOT_KEY" \
-                   -H "Content-Type: application/json" \
-                   --data @payload.json \
-                   https://api.moonshot.ai/v1/chat/completions)
-
-          echo "Moonshot HTTP $STATUS"
-          cat resp.json
-          [[ "$STATUS" == 200 ]] || exit 1
-
-          jq -r '.choices[0].message.content' resp.json > review.txt
-          echo "REVIEW<<EOF" >> "$GITHUB_OUTPUT"
-          cat review.txt >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-
-# 5️⃣  comment on the PR (skipped for manual run)
-      - if: github.event_name != 'workflow_dispatch'
-        env: { GH_TOKEN: ${{ github.token }} }
-        run: |
-          BODY=$(jq -Rs '.' <<< "🤖 **Kimi-Dev review**  \n_Model:_ ${{ steps.ctx.outputs.MODE }}\n\n$(cat review.txt)")
-          curl -s -X POST \
-               -H "Authorization: Bearer $GH_TOKEN" \
-               -H "Accept: application/vnd.github+json" \
-               -d "{\"body\": $BODY}" \
-               "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments"
-
-# 6️⃣  save raw response (optional)
-      - if: always()
+      # NEW: Upload the code blob artifact for debugging
+      # Improvement: If something goes wrong, you can download and inspect exactly what code was sent to the AI.
+      - name: ⬆️ Upload Collected Code Blob (for Debugging)
+        if: always() # Always upload, even if the previous step failed or skipped
         uses: actions/upload-artifact@v4
         with:
-          name: moonshot-response
-          path: resp.json
+          name: collected-code-blob
+          path: code_blob.txt # The file created in the previous step
+          retention-days: 1 # Keep for 1 day to save storage, useful for recent runs
+
+      # --- AI Processing & Commenting ---
+
+      # 7. Call Moonshot AI for Code Review
+      # IMPROVEMENT: More specific error message for HTTP 400 (token limit)
+      - name: 🧠 Call Moonshot AI for Code Review
+        id: kimi # ID for this step's outputs
+        run: |
+          PAYLOAD_FILE="payload.json"
+          REVIEW_FILE="review.txt"
+          RESPONSE_FILE="resp.json" # File to save the raw JSON response from Moonshot
+
+          # Check if the review was skipped (e.g., empty code blob)
+          if [[ "${{ steps.blob.outputs.REVIEW_SKIPPED }}" == "true" ]]; then
+            echo "Review was skipped by a previous step (empty code blob). Skipping Moonshot AI call."
+            # Set a default message that will be used in the PR comment
+            echo "REVIEW_COMMENT=No significant code changes found or all changes were in excluded paths. Skipping Kimi-Dev review." >> $GITHUB_OUTPUT
+            exit 0 # Exit this step successfully
+          fi
+
+          # Double-check if the code blob file exists before proceeding
+          CODE_BLOB_PATH="${{ steps.blob.outputs.FILE }}"
+          if [ ! -f "$CODE_BLOB_PATH" ]; then
+              echo "::error ::Internal workflow error: Code blob file not found at '$CODE_BLOB_PATH'. Cannot proceed with review."
+              exit 1
+          fi
+
+          echo "Preparing request for Moonshot AI model: ${{ env.SELECTED_MOONSHOT_MODEL }}"
+          # Construct the JSON payload with the selected model and the collected code
+          jq -n --rawfile diff "$CODE_BLOB_PATH" \
+                --arg m "${{ env.SELECTED_MOONSHOT_MODEL }}" '{
+            model: $m,
+            messages:[
+              {role:"system",
+               content:"You are an expert software engineer. Provide a concise, line-referenced GitHub code review. Focus on logical errors, best practices, potential improvements, and security vulnerabilities. Use markdown formatting for code snippets, bullet points for lists, and clearly separate distinct review points."},
+              {role:"user", content: $diff}
+            ],
+            max_tokens: 1024, # Adjust as needed based on desired review length
+            temperature: 0.2
+          }' > "$PAYLOAD_FILE"
+
+          echo "Sending request to Moonshot AI..."
+          STATUS=""
+          API_ERROR_MESSAGE="" # NEW: Variable to store specific API error message
+
+          for a in 0 1 2; do # Retry up to 3 times (initial attempt + 2 retries)
+            RESPONSE_RAW=$(curl -s -w "%{http_code}" -o "$RESPONSE_FILE" \
+                       -H "Authorization: Bearer $MOONSHOT_KEY" \
+                       -H "Content-Type: application/json" \
+                       --data @"$PAYLOAD_FILE" \
+                       https://api.moonshot.ai/v1/chat/completions)
+            STATUS="${RESPONSE_RAW:(-3)}" # Extract the HTTP status code (last 3 characters)
+
+            if [[ "$STATUS" == "200" ]]; then
+              echo "✅ Moonshot AI call successful (HTTP $STATUS)."
+              break # Success! Exit the retry loop
+            elif [[ "$STATUS" == "400" ]]; then # NEW: Specific check for HTTP 400 errors
+                API_ERROR_MESSAGE=$(jq -r '.error.message // "Unknown 400 error"' "$RESPONSE_FILE")
+                echo "::error ::Moonshot AI call failed with HTTP 400 (Bad Request). This often means: '$API_ERROR_MESSAGE'."
+                echo "This could be due to exceeding the model's token limit, an invalid payload, or other input issues."
+                break # Do not retry 400 errors, as they are usually input-related
+            elif [[ "$STATUS" =~ 429|5.. ]]; then # Check for Rate Limit (429) or Server Error (5xx)
+              SLEEP_TIME=$(( (2**a)*5 )) # Calculate exponential backoff for retries
+              echo "Moonshot AI call failed with HTTP $STATUS. Retrying in ${SLEEP_TIME} seconds..."
+              sleep "$SLEEP_TIME"
+            else
+              echo "Moonshot AI call failed with unexpected HTTP $STATUS. No more retries for this type of error."
+              echo "Raw API response for debugging:"
+              cat "$RESPONSE_FILE" # Print the raw response for non-retryable errors
+              break # Exit loop for non-retryable errors
+            fi
+          done
+
+          echo "Final Moonshot AI HTTP Status: $STATUS"
+          if [[ "$STATUS" != "200" ]]; then
+            echo "::error ::Moonshot AI call ultimately failed after retries with HTTP $STATUS."
+            if [[ -n "$API_ERROR_MESSAGE" ]]; then
+                echo "Specific API message: '$API_ERROR_MESSAGE'"
+            fi
+            echo "Possible causes: Invalid 'MOONSHOT_KEY', unsupported model, persistent Moonshot AI service issues, or code blob size issue."
+            exit 1 # Fail the workflow if the API call was unsuccessful
+          fi
+
+          # Extract the actual review text from the JSON response
+          jq -r '.choices[0].message.content' "$RESPONSE_FILE" > "$REVIEW_FILE"
+          
+          # This captures the multi-line review content and makes it available to later steps.
+          {
+            echo "REVIEW_COMMENT<<EOF"
+            cat "$REVIEW_FILE" # The actual review content
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "✅ Review content successfully generated from Moonshot AI."
+
+      # 8. Post Review Comment to Pull Request
+      # Improvement: Clearer conditional, more robust message in case of empty review.
+      - name: 💬 Post Kimi-Dev Review Comment to Pull Request
+        # Only runs if it's a Pull Request (not manual workflow_dispatch) AND review wasn't skipped
+        if: github.event_name != 'workflow_dispatch' && steps.blob.outputs.REVIEW_SKIPPED != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }} # GitHub's special token for interacting with the PR
+        run: |
+          REVIEW_BODY="${{ steps.kimi.outputs.REVIEW_COMMENT }}"
+          MODEL_USED="${{ env.SELECTED_MOONSHOT_MODEL }}" # The model that was actually used
+
+          if [ -z "$REVIEW_BODY" ]; then
+            # If for some reason the AI didn't return any content, provide a fallback message
+            REVIEW_BODY="Kimi-Dev review ran, but no content was returned by the AI. This could be a temporary Moonshot AI issue or the input was too small/large."
+            echo "::warning::$REVIEW_BODY"
+          fi
+
+          # Construct the JSON payload for the GitHub API comment. 'jq -n --arg' is robust for this.
+          COMMENT_JSON=$(jq -n \
+                              --arg body_content "$REVIEW_BODY" \
+                              --arg model_used "$MODEL_USED" '{
+            body: "🤖 **Kimi-Dev Review**\n_Model:_ `\($model_used)`\n\n\($body_content)"
+          }')
+
+          echo "Posting review comment to PR #${{ github.event.pull_request.number }}..."
+          curl -s -X POST \
+               -H "Authorization: Bearer $GH_TOKEN" \
+               -H "Accept: application/vnd.github.v3+json" \
+               -d "$COMMENT_JSON" \
+               "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments"
+          echo "✅ Review comment posted."
+
+      # 9. Upload Moonshot Raw Response as Artifact (for Debugging)
+      # Improvement: Clearer name, ensures it's always uploaded for debugging.
+      - name: ⬆️ Upload Moonshot Raw Response (for Debugging)
+        if: always() # This step will always run, even if previous steps failed, which is useful for debugging
+        uses: actions/upload-artifact@v4
+        with:
+          name: moonshot-raw-response # A descriptive name for the artifact
+          path: resp.json # The file containing the raw JSON response from Moonshot
+          retention-days: 1 # Keep this artifact for 1 day to save storage, good for recent troubleshooting
